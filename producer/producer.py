@@ -102,8 +102,8 @@ def fetch_data():
 
     df = pd.DataFrame(data["values"])
 
-    df["time"] = pd.to_datetime(df["datetime"])
-    df["time"] = df["time"].dt.tz_localize("UTC").dt.tz_convert(IST)
+    df["time"] = pd.to_datetime(df["datetime"], utc=True)
+    df["time"] = df["time"].dt.tz_convert(IST)
 
     df = df.astype({
         "open": float,
