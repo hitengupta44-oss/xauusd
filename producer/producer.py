@@ -1,9 +1,8 @@
-```python
+import os
 import pandas as pd
 import numpy as np
 import requests
 import time
-import os
 from datetime import timedelta
 from sklearn.preprocessing import MinMaxScaler
 from tensorflow.keras.models import Sequential
@@ -11,7 +10,6 @@ from tensorflow.keras.layers import LSTM, Dense, Dropout, Input
 import ta
 import pytz
 
-# ===== Flask keep-alive (Render) =====
 from flask import Flask
 import threading
 
@@ -19,15 +17,13 @@ app = Flask(__name__)
 
 @app.route("/")
 def home():
-    return "XAUUSD Producer running"
+    return "XAUUSD Producer Running"
 
 def run_flask():
     port = int(os.environ.get("PORT", 10000))
     app.run(host="0.0.0.0", port=port)
 
 threading.Thread(target=run_flask).start()
-
-# ================= CONFIG =================
 
 BACKEND_URL = "https://xauusd-klue.onrender.com/update"
 
@@ -49,9 +45,6 @@ scaler = MinMaxScaler()
 last_candle_time = None
 last_train_time = None
 
-
-# ================= MODEL =================
-
 def build_model(n_features):
     model = Sequential([
         Input(shape=(LOOKBACK, n_features)),
@@ -64,11 +57,7 @@ def build_model(n_features):
     model.compile(optimizer="adam", loss="mse")
     return model
 
-
-# ================= FETCH DATA =================
-
 def fetch_data():
-
     url = "https://api.twelvedata.com/time_series"
 
     params = {
@@ -82,12 +71,13 @@ def fetch_data():
     data = r.json()
 
     if "values" not in data:
-        print("API Error:", data)
+        print("API error:", data)
         return None
 
     df = pd.DataFrame(data["values"])
 
-    df["time"] = pd.to_datetime(df["datetime"]).dt.tz_localize("UTC").dt.tz_convert(IST)
+    df["time"] = pd.to_datetime(df["datetime"])
+    df["time"] = df["time"].dt.tz_localize("UTC").dt.tz_convert(IST)
 
     df = df.astype({
         "open": float,
@@ -97,18 +87,13 @@ def fetch_data():
     })
 
     df["volume"] = 1
-
     df = df.sort_values("time")
 
     return df[["time","open","high","low","close","volume"]]
 
-
-# ================= MAIN LOOP =================
-
 while True:
 
     try:
-
         df = fetch_data()
 
         if df is None or len(df) < 100:
@@ -126,7 +111,6 @@ while True:
         last_candle_time = current_time
         print("New candle:", current_time)
 
-        # ===== Indicators =====
         df["EMA20"] = df["close"].ewm(span=20).mean()
         df["SMA50"] = df["close"].rolling(50).mean()
         df["RSI"] = ta.momentum.RSIIndicator(df["close"], window=14).rsi()
@@ -138,20 +122,19 @@ while True:
         features = ["RET","EMA20","SMA50","RSI","VWAP"]
         scaled = scaler.fit_transform(df[features])
 
-        # ===== Sequences =====
         X, y = [], []
 
         for i in range(LOOKBACK, len(scaled)):
             X.append(scaled[i-LOOKBACK:i])
             y.append(scaled[i,0])
 
-        X, y = np.array(X), np.array(y)
+        X = np.array(X)
+        y = np.array(y)
 
         if len(X) == 0:
             time.sleep(60)
             continue
 
-        # ===== Train =====
         if model is None:
             model = build_model(len(features))
             model.fit(X, y, epochs=3, batch_size=32, verbose=0)
@@ -161,12 +144,9 @@ while True:
             model.fit(X, y, epochs=1, batch_size=32, verbose=0)
             last_train_time = time.time()
 
-        # ===== Send real candles =====
-
         real60 = df.tail(60)
 
         for _, row in real60.iterrows():
-
             requests.post(BACKEND_URL, json={
                 "time": row["time"].isoformat(),
                 "open": float(row["open"]),
@@ -180,8 +160,6 @@ while True:
                 "signal": None,
                 "type": "real"
             }, timeout=5)
-
-        # ===== Predictions =====
 
         volatility = df["RET"].std()
         last_price = df.iloc[-1]["close"]
@@ -214,4 +192,3 @@ while True:
         print("Error:", e)
 
     time.sleep(60)
-```
