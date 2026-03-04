@@ -13,6 +13,8 @@ import pytz
 from flask import Flask
 import threading
 
+# ================= FLASK SERVER (Render requires open port) =================
+
 app = Flask(__name__)
 
 @app.route("/")
@@ -23,9 +25,14 @@ def run_flask():
     port = int(os.environ.get("PORT", 10000))
     app.run(host="0.0.0.0", port=port)
 
-threading.Thread(target=run_flask).start()
+threading.Thread(target=run_flask, daemon=True).start()
+
+
+# ================= CONFIG =================
 
 BACKEND_URL = "https://xauusd-klue.onrender.com/update"
+BACKEND_HOME = "https://xauusd-klue.onrender.com/"
+SERVICE_URL = "https://producer-ngxd.onrender.com/"
 
 API_KEY = os.getenv("TWELVEDATA_API_KEY")
 
@@ -40,12 +47,22 @@ IST = pytz.timezone("Asia/Kolkata")
 
 print("Producer started — XAUUSD 5m")
 
+
+# ================= VARIABLES =================
+
 model = None
 scaler = MinMaxScaler()
 last_candle_time = None
 last_train_time = None
 
+last_self_ping = 0
+last_backend_ping = 0
+
+
+# ================= MODEL =================
+
 def build_model(n_features):
+
     model = Sequential([
         Input(shape=(LOOKBACK, n_features)),
         LSTM(64, return_sequences=True),
@@ -54,10 +71,19 @@ def build_model(n_features):
         Dense(16, activation="relu"),
         Dense(1)
     ])
-    model.compile(optimizer="adam", loss="mse")
+
+    model.compile(
+        optimizer="adam",
+        loss="mse"
+    )
+
     return model
 
+
+# ================= FETCH DATA =================
+
 def fetch_data():
+
     url = "https://api.twelvedata.com/time_series"
 
     params = {
@@ -91,9 +117,38 @@ def fetch_data():
 
     return df[["time","open","high","low","close","volume"]]
 
+
+# ================= MAIN LOOP =================
+
 while True:
 
     try:
+
+        # ===== SELF KEEP ALIVE =====
+        if time.time() - last_self_ping > 300:
+
+            try:
+                requests.get(SERVICE_URL, timeout=5)
+                print("Self ping successful")
+            except:
+                print("Self ping failed")
+
+            last_self_ping = time.time()
+
+
+        # ===== BACKEND KEEP ALIVE =====
+        if time.time() - last_backend_ping > 300:
+
+            try:
+                requests.get(BACKEND_HOME, timeout=5)
+                print("Backend ping successful")
+            except:
+                print("Backend ping failed")
+
+            last_backend_ping = time.time()
+
+
+        # ===== FETCH DATA =====
         df = fetch_data()
 
         if df is None or len(df) < 100:
@@ -101,6 +156,8 @@ while True:
             time.sleep(60)
             continue
 
+
+        # ===== NEW CANDLE CHECK =====
         current_time = df.iloc[-1]["time"]
 
         if last_candle_time == current_time:
@@ -111,6 +168,9 @@ while True:
         last_candle_time = current_time
         print("New candle:", current_time)
 
+
+        # ===== INDICATORS =====
+
         df["EMA20"] = df["close"].ewm(span=20).mean()
         df["SMA50"] = df["close"].rolling(50).mean()
         df["RSI"] = ta.momentum.RSIIndicator(df["close"], window=14).rsi()
@@ -119,8 +179,14 @@ while True:
 
         df = df.dropna()
 
+
+        # ===== FEATURES =====
+
         features = ["RET","EMA20","SMA50","RSI","VWAP"]
         scaled = scaler.fit_transform(df[features])
+
+
+        # ===== SEQUENCES =====
 
         X, y = [], []
 
@@ -135,18 +201,27 @@ while True:
             time.sleep(60)
             continue
 
+
+        # ===== TRAIN MODEL =====
+
         if model is None:
+
             model = build_model(len(features))
             model.fit(X, y, epochs=3, batch_size=32, verbose=0)
             last_train_time = time.time()
 
         if time.time() - last_train_time > RETRAIN_INTERVAL:
+
             model.fit(X, y, epochs=1, batch_size=32, verbose=0)
             last_train_time = time.time()
+
+
+        # ===== SEND LAST 60 REAL CANDLES =====
 
         real60 = df.tail(60)
 
         for _, row in real60.iterrows():
+
             requests.post(BACKEND_URL, json={
                 "time": row["time"].isoformat(),
                 "open": float(row["open"]),
@@ -160,6 +235,9 @@ while True:
                 "signal": None,
                 "type": "real"
             }, timeout=5)
+
+
+        # ===== PREDICTIONS =====
 
         volatility = df["RET"].std()
         last_price = df.iloc[-1]["close"]
@@ -186,9 +264,13 @@ while True:
 
             last_price = pred_price
 
+
         print("Sent 60 real + 6 prediction")
 
+
     except Exception as e:
+
         print("Error:", e)
+
 
     time.sleep(60)
