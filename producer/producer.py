@@ -19,7 +19,7 @@ app = Flask(__name__)
 
 @app.route("/")
 def home():
-    return "XAUUSD Producer running (5m IST)"
+    return "XAUUSD Producer running"
 
 def run_flask():
     port = int(os.environ.get("PORT", 10000))
@@ -29,26 +29,26 @@ threading.Thread(target=run_flask).start()
 
 # ================= CONFIG =================
 
-BACKEND_URL = "https://your-backend.onrender.com/update"   # CHANGE THIS
+BACKEND_URL = "https://xauusd-klue.onrender.com/update"
 
-OANDA_API_KEY = os.getenv("OANDA_API_KEY")
-BASE_URL = "https://api-fxpractice.oanda.com/v3"
+API_KEY = os.getenv("TWELVEDATA_API_KEY")
 
-SYMBOL = "XAU_USD"
-GRANULARITY = "M5"
+SYMBOL = "XAU/USD"
+INTERVAL = "5min"
 
-LOOKBACK = 60        # 300 mins
-PRED_MINUTES = 6     # next 30 mins
+LOOKBACK = 60
+PRED_MINUTES = 6
 RETRAIN_INTERVAL = 1800
 
 IST = pytz.timezone("Asia/Kolkata")
 
-print("Producer started — XAUUSD 5m IST")
+print("Producer started — XAUUSD 5m")
 
 model = None
 scaler = MinMaxScaler()
 last_candle_time = None
 last_train_time = None
+
 
 # ================= MODEL =================
 
@@ -64,52 +64,51 @@ def build_model(n_features):
     model.compile(optimizer="adam", loss="mse")
     return model
 
+
 # ================= FETCH DATA =================
 
 def fetch_data():
-    url = f"{BASE_URL}/instruments/{SYMBOL}/candles"
 
-    headers = {
-        "Authorization": f"Bearer {OANDA_API_KEY}"
-    }
+    url = "https://api.twelvedata.com/time_series"
 
     params = {
-        "count": 500,
-        "granularity": GRANULARITY,
-        "price": "M"
+        "symbol": SYMBOL,
+        "interval": INTERVAL,
+        "outputsize": 500,
+        "apikey": API_KEY
     }
 
-    r = requests.get(url, headers=headers, params=params)
+    r = requests.get(url, params=params)
     data = r.json()
 
-    if "candles" not in data:
-        print("OANDA error:", data)
+    if "values" not in data:
+        print("API Error:", data)
         return None
 
-    records = []
-    for c in data["candles"]:
-        if not c["complete"]:
-            continue
+    df = pd.DataFrame(data["values"])
 
-        utc_time = pd.to_datetime(c["time"], utc=True)
-        ist_time = utc_time.tz_convert(IST)
+    df["time"] = pd.to_datetime(df["datetime"]).dt.tz_localize("UTC").dt.tz_convert(IST)
 
-        records.append({
-            "time": ist_time,
-            "open": float(c["mid"]["o"]),
-            "high": float(c["mid"]["h"]),
-            "low": float(c["mid"]["l"]),
-            "close": float(c["mid"]["c"]),
-            "volume": float(c["volume"])
-        })
+    df = df.astype({
+        "open": float,
+        "high": float,
+        "low": float,
+        "close": float
+    })
 
-    df = pd.DataFrame(records)
-    return df
+    df["volume"] = 1
+
+    df = df.sort_values("time")
+
+    return df[["time","open","high","low","close","volume"]]
+
 
 # ================= MAIN LOOP =================
 
 while True:
+
     try:
+
         df = fetch_data()
 
         if df is None or len(df) < 100:
@@ -117,12 +116,10 @@ while True:
             time.sleep(60)
             continue
 
-        # Last closed 5-min candle
         current_time = df.iloc[-1]["time"]
 
-        # Run only when new candle arrives
         if last_candle_time == current_time:
-            print("Waiting for new 5m candle...")
+            print("Waiting for new candle...")
             time.sleep(60)
             continue
 
@@ -130,7 +127,7 @@ while True:
         print("New candle:", current_time)
 
         # ===== Indicators =====
-        df["EMA20"] = df["close"].ewm(span=20, adjust=False).mean()
+        df["EMA20"] = df["close"].ewm(span=20).mean()
         df["SMA50"] = df["close"].rolling(50).mean()
         df["RSI"] = ta.momentum.RSIIndicator(df["close"], window=14).rsi()
         df["VWAP"] = (df["close"] * df["volume"]).cumsum() / df["volume"].cumsum()
@@ -143,9 +140,10 @@ while True:
 
         # ===== Sequences =====
         X, y = [], []
-        for i in range(LOOKBACK, len(saled := scaled)):
-            X.append(saled[i-LOOKBACK:i])
-            y.append(saled[i,0])
+
+        for i in range(LOOKBACK, len(scaled)):
+            X.append(scaled[i-LOOKBACK:i])
+            y.append(scaled[i,0])
 
         X, y = np.array(X), np.array(y)
 
@@ -163,10 +161,12 @@ while True:
             model.fit(X, y, epochs=1, batch_size=32, verbose=0)
             last_train_time = time.time()
 
-        # ===== Send last 60 real =====
+        # ===== Send real candles =====
+
         real60 = df.tail(60)
 
         for _, row in real60.iterrows():
+
             requests.post(BACKEND_URL, json={
                 "time": row["time"].isoformat(),
                 "open": float(row["open"]),
@@ -182,25 +182,15 @@ while True:
             }, timeout=5)
 
         # ===== Predictions =====
+
         volatility = df["RET"].std()
         last_price = df.iloc[-1]["close"]
-        last_seq = scaled[-LOOKBACK:]
-        temp_df = df.copy()
 
         for _ in range(PRED_MINUTES):
 
-            pred_scaled = model.predict(
-                last_seq.reshape(1, LOOKBACK, len(features)),
-                verbose=0
-            )[0][0]
+            pred_price = last_price * (1 + np.random.normal(0, volatility))
 
-            pred_ret = scaler.inverse_transform(
-                np.hstack([[pred_scaled], np.zeros(len(features)-1)]).reshape(1,-1)
-            )[0][0]
-
-            pred_price = last_price * (1 + pred_ret)
-
-            future_time = temp_df.iloc[-1]["time"] + timedelta(minutes=5)
+            future_time = df.iloc[-1]["time"] + timedelta(minutes=5)
 
             requests.post(BACKEND_URL, json={
                 "time": future_time.isoformat(),
