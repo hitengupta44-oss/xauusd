@@ -2,7 +2,7 @@ pandas
 numpy
 requests
 scikit-learn
-tensorflow
+tensorflow==2.15.0
 ta
 flask
 pytz
